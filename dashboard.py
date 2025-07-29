@@ -12,7 +12,7 @@ warnings.filterwarnings('ignore')
 
 # Page config
 st.set_page_config(
-    page_title="Return Fraud Detection Dashboard",
+    page_title="AutoFlag",
     page_icon="🛡️",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -61,7 +61,7 @@ def load_and_process_data():
     return detector, results
 
 def main():
-    st.markdown('<h1 class="main-header">🛡️ Return Fraud Detection Dashboard</h1>', unsafe_allow_html=True)
+    st.markdown('<h1 class="main-header">🛡️ AutoFlag</h1>', unsafe_allow_html=True)
     
     # Load data
     with st.spinner("Loading and analyzing data..."):
