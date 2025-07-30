@@ -6,6 +6,8 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import seaborn as sns
 import matplotlib.pyplot as plt
+import io
+from generate_dataset import ECommerceDataGenerator
 from fraud_detector import ReturnFraudDetector
 import warnings
 warnings.filterwarnings('ignore')
@@ -47,30 +49,119 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 @st.cache_data
-def load_and_process_data():
-    """Load and process data with caching"""
+def load_and_process_data(custom_files, synth_params):
+    """Load and process data with caching or user-provided CSVs"""
     detector = ReturnFraudDetector()
     
-    if not detector.load_data():
-        st.error("Failed to load data. Please ensure CSV files are present.")
-        return None, None
+    # Option 1: Generate synthetic dataset on the fly
+    if synth_params is not None and synth_params.get('generate', False):
+        gen = ECommerceDataGenerator()
+        c_df, p_df, o_df, r_df = gen.run(
+            n_customers=synth_params['customers'],
+            fraud_ratio=synth_params['fraud_ratio'],
+            n_orders=synth_params['orders']
+        )
+        detector.customers = c_df
+        detector.products = p_df
+        detector.orders   = o_df
+        detector.returns  = r_df
+        # Proceed directly with synthetic data
+        features = detector.engineer_features()
+        results  = detector.detect_anomalies()
+        return detector, results
+    # Option 2: User-uploaded files (only executed if synthetic not chosen)
+    if all(v is not None for v in [custom_files['customers'], custom_files['orders'], custom_files['returns'], custom_files['products']]):
+        try:
+            detector.customers = pd.read_csv(custom_files['customers'])
+            detector.orders    = pd.read_csv(custom_files['orders'])
+            detector.returns   = pd.read_csv(custom_files['returns'])
+            # products optional
+            detector.products = pd.read_csv(custom_files['products'])
+        except Exception as e:
+            st.error(f"Failed to read uploaded CSVs: {e}")
+            return None, None
+    else:
+        if not detector.load_data():
+            st.error("Failed to load default data. Please ensure CSV files are present.")
+            return None, None
     
     features = detector.engineer_features()
-    results = detector.detect_anomalies()
-    
+    results  = detector.detect_anomalies()
     return detector, results
 
 def main():
     st.markdown('<h1 class="main-header">🛡️ AutoFlag</h1>', unsafe_allow_html=True)
+    st.info("Add your own datasets or generate a synthetic dataset using the sidebar.")
     
-    # Load data
+    # Sidebar upload widgets
+    st.sidebar.header("📁 Upload Your Dataset (optional)")
+    st.sidebar.markdown("""
+    **Expected columns:**
+    • `customers.csv` — `customer_id`, `registration_date`
+    • `orders.csv` — `order_id`, `customer_id`, `product_id`, `order_date`, `delivery_date`, `refund_amount`
+    • `returns.csv` — `return_id`, `order_id`, `return_date`, `return_reason`
+    • `products.csv` — `product_id`, `category`, `price`
+    """)
+    customers_file = st.sidebar.file_uploader("customers.csv", type=["csv"], key="cust")
+    orders_file    = st.sidebar.file_uploader("orders.csv",    type=["csv"], key="ord")
+    returns_file   = st.sidebar.file_uploader("returns.csv",   type=["csv"], key="ret")
+    products_file  = st.sidebar.file_uploader("products.csv", type=["csv"], key="prod")
+
+    custom_files = {
+        'customers': customers_file,
+        'orders': orders_file,
+        'returns': returns_file,
+        'products': products_file,
+    }
+
+    # Synthetic generation controls
+    st.sidebar.header("🧪 Or Generate Synthetic Data")
+    gen_toggle = st.sidebar.checkbox("Generate synthetic dataset now")
+    synth_params = None
+    if gen_toggle:
+        num_cust = st.sidebar.number_input("# Customers", 1000, 50000, 10000, step=1000)
+        num_orders = st.sidebar.number_input("# Orders", 5000, 300000, 60000, step=5000)
+        fraud_ratio = st.sidebar.slider("Fraud Ratio", 0.0, 0.5, 0.1, 0.01)
+        synth_params = {
+            'generate': True,
+            'customers': int(num_cust),
+            'orders': int(num_orders),
+            'fraud_ratio': float(fraud_ratio),
+        }
+
+    # Run analysis button
+    run_clicked = st.sidebar.button("▶️ Run Analysis")
+    # Determine if user has provided a dataset choice
+    has_upload = all(f is not None for f in [customers_file, orders_file, returns_file, products_file])
+
+    if not run_clicked:
+        st.info("⬅️  Upload your CSVs and click Run Analysis, or configure the synthetic generator and click Run Analysis.")
+        return
+
+    # validation after click
+    if synth_params and has_upload:
+        st.error("Please choose either uploaded data OR synthetic generation, not both.")
+        return
+    if not synth_params and not has_upload:
+        st.error("Not all required CSV files have been uploaded. Please provide customers.csv, orders.csv, returns.csv, and products.csv, or choose synthetic generation.")
+        return
+
     with st.spinner("Loading and analyzing data..."):
-        detector, results = load_and_process_data()
-    
+        detector, results = load_and_process_data(custom_files, synth_params)
     if detector is None:
-        st.error("Please run the data generation script first: `python generate_dataset.py`")
         return
     
+    # Offer download if synthetic dataset was generated
+    if synth_params is not None and synth_params.get('generate', False):
+        st.sidebar.header("⬇️ Download Generated CSVs")
+        def _csv_download(df):
+            return df.to_csv(index=False).encode('utf-8')
+        st.sidebar.download_button("customers.csv", _csv_download(detector.customers), "customers.csv", "text/csv")
+        st.sidebar.download_button("orders.csv", _csv_download(detector.orders), "orders.csv", "text/csv")
+        st.sidebar.download_button("returns.csv", _csv_download(detector.returns), "returns.csv", "text/csv")
+        if not detector.products.empty:
+            st.sidebar.download_button("products.csv", _csv_download(detector.products), "products.csv", "text/csv")
+
     # Sidebar filters
     st.sidebar.header("🔍 Filters")
     

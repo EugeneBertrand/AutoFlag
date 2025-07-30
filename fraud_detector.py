@@ -14,13 +14,14 @@ class ReturnFraudDetector:
         self.dbscan = DBSCAN(eps=0.5, min_samples=5)
         self.features = None
         
-    def load_data(self):
+    def load_data(self, data_dir="."):
         """Load all datasets"""
+        import os
         try:
-            self.customers = pd.read_csv('customers.csv')
-            self.products = pd.read_csv('products.csv')
-            self.orders = pd.read_csv('orders.csv')
-            self.returns = pd.read_csv('returns.csv')
+            self.customers = pd.read_csv(os.path.join(data_dir, "customers.csv"))
+            self.products = pd.read_csv(os.path.join(data_dir, "products.csv"))
+            self.orders = pd.read_csv(os.path.join(data_dir, "orders.csv"))
+            self.returns = pd.read_csv(os.path.join(data_dir, "returns.csv"))
             
             # Convert date columns
             date_columns = ['registration_date', 'order_date', 'delivery_date', 'return_date']
