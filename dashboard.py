@@ -48,50 +48,67 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-@st.cache_data
-def load_and_process_data(custom_files, synth_params):
-    """Load and process data with caching or user-provided CSVs"""
+def load_and_process_data(custom_files, synth_params, force_reload=False):
+    """Load data and run analysis with session state caching"""
+    # Check if we have cached results and don't need to reload
+    if not force_reload and 'detector' in st.session_state and 'analysis_results' in st.session_state:
+        return st.session_state.detector, st.session_state.analysis_results
+    
+    # If we get here, we need to (re)load the data
     detector = ReturnFraudDetector()
     
     # Option 1: Generate synthetic dataset on the fly
     if synth_params is not None and synth_params.get('generate', False):
-        gen = ECommerceDataGenerator()
-        c_df, p_df, o_df, r_df = gen.run(
-            n_customers=synth_params['customers'],
-            fraud_ratio=synth_params['fraud_ratio'],
-            n_orders=synth_params['orders']
-        )
+        key = f"{synth_params['customers']}_{synth_params['orders']}_{synth_params['fraud_ratio']}"
+        if 'synth_cache_key' not in st.session_state or st.session_state.synth_cache_key != key or force_reload:
+            gen = ECommerceDataGenerator()
+            c_df, p_df, o_df, r_df = gen.run(
+                n_customers=synth_params['customers'],
+                fraud_ratio=synth_params['fraud_ratio'],
+                n_orders=synth_params['orders']
+            )
+            st.session_state.synth_cache = (c_df, p_df, o_df, r_df)
+            st.session_state.synth_cache_key = key
+        else:
+            c_df, p_df, o_df, r_df = st.session_state.synth_cache
+            
         detector.customers = c_df
         detector.products = p_df
-        detector.orders   = o_df
-        detector.returns  = r_df
-        # Proceed directly with synthetic data
-        features = detector.engineer_features()
-        results  = detector.detect_anomalies()
-        return detector, results
-    # Option 2: User-uploaded files (only executed if synthetic not chosen)
-    if all(v is not None for v in [custom_files['customers'], custom_files['orders'], custom_files['returns'], custom_files['products']]):
+        detector.orders = o_df
+        detector.returns = r_df
+    
+    # Option 2: User-uploaded files
+    elif all(v is not None for v in custom_files.values()):
         try:
             detector.customers = pd.read_csv(custom_files['customers'])
-            detector.orders    = pd.read_csv(custom_files['orders'])
-            detector.returns   = pd.read_csv(custom_files['returns'])
-            # products optional
+            detector.orders = pd.read_csv(custom_files['orders'])
+            detector.returns = pd.read_csv(custom_files['returns'])
             detector.products = pd.read_csv(custom_files['products'])
         except Exception as e:
             st.error(f"Failed to read uploaded CSVs: {e}")
             return None, None
     else:
-        if not detector.load_data():
-            st.error("Failed to load default data. Please ensure CSV files are present.")
-            return None, None
+        return None, None
     
-    features = detector.engineer_features()
-    results  = detector.detect_anomalies()
+    # Run analysis
+    with st.spinner("Analyzing data..."):
+        # Engineer features and detect anomalies
+        detector.engineer_features()
+        results = detector.detect_anomalies()
+    
+    # Cache the results in session state
+    st.session_state.detector = detector
+    st.session_state.analysis_results = results
+    
     return detector, results
 
 def main():
+    # Initialize session state if not already done
+    if 'initialized' not in st.session_state:
+        st.session_state.initialized = True
+        st.session_state.data_loaded = False
+    
     st.markdown('<h1 class="main-header">🛡️ AutoFlag</h1>', unsafe_allow_html=True)
-    st.info("Add your own datasets or generate a synthetic dataset using the sidebar.")
     
     # Sidebar upload widgets
     st.sidebar.header("📁 Upload Your Dataset (optional)")
@@ -102,22 +119,25 @@ def main():
     • `returns.csv` — `return_id`, `order_id`, `return_date`, `return_reason`
     • `products.csv` — `product_id`, `category`, `price`
     """)
+    
+    # File uploaders
     customers_file = st.sidebar.file_uploader("customers.csv", type=["csv"], key="cust")
-    orders_file    = st.sidebar.file_uploader("orders.csv",    type=["csv"], key="ord")
-    returns_file   = st.sidebar.file_uploader("returns.csv",   type=["csv"], key="ret")
-    products_file  = st.sidebar.file_uploader("products.csv", type=["csv"], key="prod")
+    orders_file = st.sidebar.file_uploader("orders.csv", type=["csv"], key="ord")
+    returns_file = st.sidebar.file_uploader("returns.csv", type=["csv"], key="ret")
+    products_file = st.sidebar.file_uploader("products.csv", type=["csv"], key="prod")
 
     custom_files = {
         'customers': customers_file,
         'orders': orders_file,
         'returns': returns_file,
-        'products': products_file,
+        'products': products_file
     }
-
-    # Synthetic generation controls
-    st.sidebar.header("🧪 Or Generate Synthetic Data")
-    gen_toggle = st.sidebar.checkbox("Generate synthetic dataset now")
+    
+    # Synthetic data generation
+    st.sidebar.header("🛠️ Generate Synthetic Data")
+    gen_toggle = st.sidebar.toggle("Generate synthetic dataset now")
     synth_params = None
+    
     if gen_toggle:
         num_cust = st.sidebar.number_input("# Customers", 1000, 50000, 10000, step=1000)
         num_orders = st.sidebar.number_input("# Orders", 5000, 300000, 60000, step=5000)
@@ -128,27 +148,64 @@ def main():
             'orders': int(num_orders),
             'fraud_ratio': float(fraud_ratio),
         }
-
-    # Run analysis button
-    run_clicked = st.sidebar.button("▶️ Run Analysis")
-    # Determine if user has provided a dataset choice
-    has_upload = all(f is not None for f in [customers_file, orders_file, returns_file, products_file])
-
-    if not run_clicked:
+    
+    # Add Run Analysis button
+    if st.sidebar.button("▶️ Run Analysis"):
+        # Validate inputs
+        has_upload = all(f is not None for f in [customers_file, orders_file, returns_file, products_file])
+        
+        if synth_params and has_upload:
+            st.error("Please choose either uploaded data OR synthetic generation, not both.")
+            st.stop()
+            
+        if not synth_params and not has_upload:
+            st.error("Not all required CSV files have been uploaded. Please provide customers.csv, orders.csv, returns.csv, and products.csv, or choose synthetic generation.")
+            st.stop()
+        
+        # Set flag to indicate we should load data
+        st.session_state.should_load_data = True
+        st.session_state.synth_params = synth_params
+        st.session_state.custom_files = {
+            'customers': customers_file,
+            'orders': orders_file,
+            'returns': returns_file,
+            'products': products_file
+        }
+        st.rerun()
+    
+    # Check if we should load data
+    if st.session_state.get('should_load_data', False):
+        with st.spinner("Loading and analyzing data..."):
+            try:
+                detector, results = load_and_process_data(
+                    st.session_state.custom_files,
+                    st.session_state.synth_params,
+                    force_reload=True
+                )
+                if detector is not None and results is not None:
+                    st.session_state.detector = detector
+                    st.session_state.analysis_results = results
+                    st.session_state.data_loaded = True
+                    st.session_state.should_load_data = False
+                    st.rerun()
+                else:
+                    st.error("Failed to load or process data. Please check your inputs and try again.")
+                    st.session_state.should_load_data = False
+            except Exception as e:
+                st.error(f"An error occurred: {str(e)}")
+                st.session_state.should_load_data = False
+        return
+    
+    # Only show the initial message if we're not in the middle of loading data
+    if not st.session_state.get('should_load_data', False) and not st.session_state.data_loaded:
         st.info("⬅️  Upload your CSVs and click Run Analysis, or configure the synthetic generator and click Run Analysis.")
         return
-
-    # validation after click
-    if synth_params and has_upload:
-        st.error("Please choose either uploaded data OR synthetic generation, not both.")
-        return
-    if not synth_params and not has_upload:
-        st.error("Not all required CSV files have been uploaded. Please provide customers.csv, orders.csv, returns.csv, and products.csv, or choose synthetic generation.")
-        return
-
-    with st.spinner("Loading and analyzing data..."):
-        detector, results = load_and_process_data(custom_files, synth_params)
-    if detector is None:
+    
+    # If we have data loaded, show the dashboard
+    if st.session_state.data_loaded and 'detector' in st.session_state and 'analysis_results' in st.session_state:
+        detector = st.session_state.detector
+        results = st.session_state.analysis_results
+    else:
         return
     
     # Offer download if synthetic dataset was generated
@@ -165,26 +222,45 @@ def main():
     # Sidebar filters
     st.sidebar.header("🔍 Filters")
     
-    # Fraud score threshold
-    fraud_threshold = st.sidebar.slider(
+    # Initialize filter values in session state if they don't exist
+    if 'fraud_threshold' not in st.session_state:
+        st.session_state.fraud_threshold = 0.33
+    if 'min_return_rate' not in st.session_state:
+        st.session_state.min_return_rate = 0.0
+    
+    # Update filter values from UI
+    new_fraud_threshold = st.sidebar.slider(
         "Fraud Score Threshold", 
         min_value=0.0, 
         max_value=1.0, 
-        value=0.33, 
+        value=st.session_state.fraud_threshold, 
         step=0.1,
         help="Customers above this threshold are flagged as suspicious"
     )
     
-    # Return rate filter
-    min_return_rate = st.sidebar.slider(
+    new_min_return_rate = st.sidebar.slider(
         "Minimum Return Rate", 
         min_value=0.0, 
         max_value=1.0, 
-        value=0.0, 
+        value=st.session_state.min_return_rate, 
         step=0.1
     )
     
-    # Filter data
+    # Check if filters changed
+    filters_changed = (new_fraud_threshold != st.session_state.fraud_threshold or 
+                      new_min_return_rate != st.session_state.min_return_rate)
+    
+    # Update session state if filters changed
+    if filters_changed:
+        st.session_state.fraud_threshold = new_fraud_threshold
+        st.session_state.min_return_rate = new_min_return_rate
+        st.rerun()
+    
+    # Get filter values from session state with defaults
+    fraud_threshold = st.session_state.get('fraud_threshold', 0.33)
+    min_return_rate = st.session_state.get('min_return_rate', 0.0)
+    
+    # Filter the results
     filtered_results = results[
         (results['fraud_score'] >= fraud_threshold) &
         (results['return_rate'] >= min_return_rate)
@@ -235,6 +311,12 @@ def main():
             help="Average return rate across all customers"
         )
         st.markdown('</div>', unsafe_allow_html=True)
+    
+    # Store filter values in a dict to pass to tabs
+    filter_params = {
+        'fraud_threshold': fraud_threshold,
+        'min_return_rate': min_return_rate
+    }
     
     # Tabs for different views
     tab1, tab2, tab3, tab4, tab5 = st.tabs([
