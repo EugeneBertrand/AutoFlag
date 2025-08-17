@@ -52,12 +52,6 @@ streamlit run dashboard.py
 - **Performance metrics**: Model evaluation and tuning
 - **Pattern visualization**: Fraud trends and insights
 
-### 🔄 Flexible Data Workflow
-- **Upload your own CSVs**: Bring real e-commerce data (`customers`, `orders`, `returns`, `products`).
-- **One-click synthetic generation**: Generate configurable datasets (customers, orders, fraud ratio) directly from the sidebar.
-- **Download generated data**: Export the freshly created synthetic CSVs for offline experiments.
-- **Run Analysis button**: Pipeline won’t start until all required CSVs are provided or synthetic generation is enabled.
-
 ## 🗂️ Dataset Schema
 
 ### Customers (`customers.csv`)

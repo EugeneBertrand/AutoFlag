@@ -4,8 +4,35 @@ from sklearn.ensemble import IsolationForest
 from sklearn.cluster import DBSCAN
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
+from tqdm import tqdm
 import warnings
+import time
+from functools import lru_cache
 warnings.filterwarnings('ignore')
+
+# Global flag to enable/disable progress bars
+SHOW_PROGRESS = True
+
+class ProgressWrapper:
+    def __init__(self, iterable, desc=None, total=None, disable=False):
+        self.iterable = iterable
+        self.desc = desc
+        self.total = total
+        self.disable = disable or not SHOW_PROGRESS
+        self._pbar = None
+    
+    def __enter__(self):
+        if not self.disable:
+            self._pbar = tqdm(total=self.total, desc=self.desc, ncols=100)
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self._pbar is not None:
+            self._pbar.close()
+    
+    def update(self, n=1):
+        if self._pbar is not None:
+            self._pbar.update(n)
 
 class ReturnFraudDetector:
     def __init__(self):
@@ -38,6 +65,7 @@ class ReturnFraudDetector:
     
     def engineer_features(self):
         """Create behavioral features for fraud detection"""
+        start_time = time.time()
         print("Engineering features...")
         
         # Customer-level behavioral features
@@ -49,152 +77,258 @@ class ReturnFraudDetector:
         # Merge features
         self.features = customer_features.merge(
             product_features, 
-            left_on='customer_id', 
-            right_on='customer_id', 
+            on='customer_id', 
             how='left'
         ).fillna(0)
         
-        print(f"Created {len(self.features.columns)-1} features for {len(self.features)} customers")
+        # Add memory-efficient dtypes
+        self._optimize_dtypes()
+        
+        elapsed = time.time() - start_time
+        print(f"✅ Created {len(self.features.columns)-1} features for {len(self.features):,} customers in {elapsed:.1f}s")
         return self.features
+        
+    def _optimize_dtypes(self):
+        """Optimize DataFrame dtypes for memory efficiency"""
+        if self.features is None:
+            return
+            
+        for col in self.features.columns:
+            col_type = self.features[col].dtype
+            
+            # Downcast numeric columns
+            if col_type == 'float64':
+                self.features[col] = pd.to_numeric(self.features[col], downcast='float')
+            elif col_type == 'int64':
+                self.features[col] = pd.to_numeric(self.features[col], downcast='integer')
     
     def _create_customer_features(self):
-        """Create customer-level behavioral features"""
-        # Merge orders and returns
-        order_return_data = self.orders.merge(
-            self.returns, on='order_id', how='left', suffixes=('', '_return')
+        """Create customer-level behavioral features using vectorized operations"""
+        start_time = time.time()
+        
+        # Pre-merge all data for vectorized operations
+        merged = self.orders.merge(
+            self.returns, 
+            on='order_id', 
+            how='left', 
+            suffixes=('', '_return')
         )
         
-        # Merge with products to get category information
-        order_return_data = order_return_data.merge(
+        # Add product info
+        merged = merged.merge(
             self.products[['product_id', 'category', 'price']], 
             on='product_id', 
             how='left'
         )
         
-        # Customer aggregations
-        customer_stats = []
+        # Calculate days to return if not exists
+        if 'days_to_return' not in merged.columns and 'return_date' in merged.columns:
+            merged['days_to_return'] = (pd.to_datetime(merged['return_date']) - pd.to_datetime(merged['order_date'])).dt.days
         
-        for customer_id in self.customers['customer_id'].unique():
-            customer_orders = order_return_data[order_return_data['customer_id'] == customer_id]
-            customer_returns = customer_orders.dropna(subset=['return_id'])
-            
-            # Basic stats
-            total_orders = len(customer_orders)
-            total_returns = len(customer_returns)
-            return_rate = total_returns / total_orders if total_orders > 0 else 0
-            
-            # Financial stats
-            total_spent = customer_orders['total_amount'].sum()
-            total_refunded = customer_returns['refund_amount'].sum()
-            avg_order_value = customer_orders['total_amount'].mean() if total_orders > 0 else 0
-            
-            # Timing patterns
-            if total_returns > 0:
-                avg_return_days = customer_returns['days_to_return'].mean()
-                returns_within_7_days = (customer_returns['days_to_return'] <= 7).sum()
-                returns_after_25_days = (customer_returns['days_to_return'] >= 25).sum()
-                late_return_rate = returns_after_25_days / total_returns
-            else:
-                avg_return_days = 0
-                returns_within_7_days = 0
-                late_return_rate = 0
-            
-            # Category diversity
-            returned_categories = customer_returns['category'].nunique() if total_returns > 0 else 0
-            
-            # Expensive item returns (top 25% price range)
-            expensive_threshold = self.products['price'].quantile(0.75)
-            expensive_returns = customer_returns[
-                customer_returns['price'] >= expensive_threshold
-            ]
-            expensive_return_rate = len(expensive_returns) / total_returns if total_returns > 0 else 0
-            
-            # Rejection patterns
-            rejected_returns = customer_returns[customer_returns['return_status'] == 'Rejected']
-            rejection_rate = len(rejected_returns) / total_returns if total_returns > 0 else 0
-            
-            # Suspicious reasons
-            suspicious_reasons = ['Empty box received', 'Item used/worn']
-            suspicious_returns = customer_returns[
-                customer_returns['return_reason'].isin(suspicious_reasons)
-            ]
-            suspicious_reason_rate = len(suspicious_returns) / total_returns if total_returns > 0 else 0
-            
-            customer_stats.append({
-                'customer_id': customer_id,
-                'total_orders': total_orders,
-                'total_returns': total_returns,
-                'return_rate': return_rate,
-                'total_spent': total_spent,
-                'total_refunded': total_refunded,
-                'avg_order_value': avg_order_value,
-                'avg_return_days': avg_return_days,
-                'returns_within_7_days': returns_within_7_days,
-                'late_return_rate': late_return_rate,
-                'returned_categories': returned_categories,
-                'expensive_return_rate': expensive_return_rate,
-                'rejection_rate': rejection_rate,
-                'suspicious_reason_rate': suspicious_reason_rate
-            })
+        # Calculate expensive threshold once
+        expensive_threshold = self.products['price'].quantile(0.75)
+        suspicious_reasons = ['Empty box received', 'Item used/worn']
         
-        return pd.DataFrame(customer_stats)
+        # Group by customer and compute all metrics in one pass
+        customer_groups = merged.groupby('customer_id')
+        
+        # Basic metrics
+        result = customer_groups.agg(
+            total_orders=pd.NamedAgg(column='order_id', aggfunc='nunique'),
+            total_returns=pd.NamedAgg(column='return_id', aggfunc='count'),
+            total_spent=pd.NamedAgg(column='total_amount', aggfunc='sum'),
+            total_refunded=pd.NamedAgg(column='refund_amount', aggfunc='sum'),
+            avg_order_value=pd.NamedAgg(column='total_amount', aggfunc='mean'),
+            returned_categories=pd.NamedAgg(column='category', aggfunc=lambda x: x.nunique() if x.notna().any() else 0)
+        ).reset_index()
+        
+        # Calculate return rate
+        result['return_rate'] = result['total_returns'] / result['total_orders']
+        result['return_rate'].fillna(0, inplace=True)
+        
+        # Calculate return timing metrics
+        if 'days_to_return' in merged.columns:
+            return_timing = merged[merged['return_id'].notna()].groupby('customer_id').agg(
+                avg_return_days=pd.NamedAgg(column='days_to_return', aggfunc='mean'),
+                returns_within_7_days=pd.NamedAgg(
+                    column='days_to_return', 
+                    aggfunc=lambda x: (x <= 7).sum()
+                ),
+                late_return_rate=pd.NamedAgg(
+                    column='days_to_return',
+                    aggfunc=lambda x: (x >= 25).mean() if len(x) > 0 else 0
+                )
+            )
+            result = result.merge(return_timing, on='customer_id', how='left')
+            
+            # Fill NaN values for customers with no returns
+            result['avg_return_days'].fillna(0, inplace=True)
+            result['returns_within_7_days'].fillna(0, inplace=True)
+            result['late_return_rate'].fillna(0, inplace=True)
+        
+        # Calculate expensive return rate
+        if 'price' in merged.columns:
+            expensive_returns = merged[
+                (merged['price'] >= expensive_threshold) & 
+                (merged['return_id'].notna())
+            ].groupby('customer_id').size().reset_index(name='expensive_returns')
+            
+            result = result.merge(expensive_returns, on='customer_id', how='left')
+            result['expensive_returns'].fillna(0, inplace=True)
+            result['expensive_return_rate'] = result['expensive_returns'] / result['total_returns']
+            result['expensive_return_rate'].fillna(0, inplace=True)
+            result.drop('expensive_returns', axis=1, inplace=True)
+        
+        # Calculate rejection rate
+        if 'return_status' in merged.columns:
+            rejected = merged[merged['return_status'] == 'Rejected']
+            if not rejected.empty:
+                rejection_counts = rejected.groupby('customer_id').size().reset_index(name='rejected_returns')
+                result = result.merge(rejection_counts, on='customer_id', how='left')
+                result['rejected_returns'].fillna(0, inplace=True)
+                result['rejection_rate'] = result['rejected_returns'] / result['total_returns']
+                result['rejection_rate'].fillna(0, inplace=True)
+                result.drop('rejected_returns', axis=1, inplace=True)
+        
+        # Calculate suspicious reason rate
+        if 'return_reason' in merged.columns:
+            suspicious = merged[merged['return_reason'].isin(suspicious_reasons)]
+            if not suspicious.empty:
+                suspicious_counts = suspicious.groupby('customer_id').size().reset_index(name='suspicious_returns')
+                result = result.merge(suspicious_counts, on='customer_id', how='left')
+                result['suspicious_returns'].fillna(0, inplace=True)
+                result['suspicious_reason_rate'] = result['suspicious_returns'] / result['total_returns']
+                result['suspicious_reason_rate'].fillna(0, inplace=True)
+                result.drop('suspicious_returns', axis=1, inplace=True)
+        
+        # Ensure all expected columns exist
+        expected_columns = {
+            'avg_return_days': 0,
+            'returns_within_7_days': 0,
+            'late_return_rate': 0,
+            'expensive_return_rate': 0,
+            'rejection_rate': 0,
+            'suspicious_reason_rate': 0
+        }
+        
+        for col, default in expected_columns.items():
+            if col not in result.columns:
+                result[col] = default
+        
+        # Reorder columns for consistency
+        column_order = [
+            'customer_id', 'total_orders', 'total_returns', 'return_rate',
+            'total_spent', 'total_refunded', 'avg_order_value', 'avg_return_days',
+            'returns_within_7_days', 'late_return_rate', 'returned_categories',
+            'expensive_return_rate', 'rejection_rate', 'suspicious_reason_rate'
+        ]
+        
+        result = result[[col for col in column_order if col in result.columns]]
+        
+        elapsed = time.time() - start_time
+        print(f"  ✓ Processed customer features in {elapsed:.1f}s")
+        
+        return result
     
     def _create_product_features(self):
         """Create product-level features aggregated by customer"""
-        # Product return rates
-        product_returns = self.returns.groupby('product_id').agg({
-            'return_id': 'count',
-            'refund_amount': 'mean'
-        }).rename(columns={'return_id': 'product_return_count'})
+        start_time = time.time()
         
-        product_orders = self.orders.groupby('product_id').size().rename('product_order_count')
+        # Calculate product return stats in one pass
+        if not self.returns.empty:
+            # Get return counts and average refunds by product
+            product_returns = self.returns.groupby('product_id').agg(
+                product_return_count=('return_id', 'count'),
+                avg_refund=('refund_amount', 'mean')
+            ).reset_index()
+            
+            # Get order counts by product
+            product_orders = self.orders.groupby('product_id').size().reset_index(name='product_order_count')
+            
+            # Merge and calculate return rate
+            product_stats = pd.merge(
+                product_returns,
+                product_orders,
+                on='product_id',
+                how='right'
+            ).fillna(0)
+            
+            product_stats['product_return_rate'] = (
+                product_stats['product_return_count'] / 
+                product_stats['product_order_count'].replace(0, np.nan)
+            ).fillna(0)
+            
+            # Merge with orders to get customer-product interactions
+            if not self.orders.empty:
+                # Merge orders with product stats
+                orders_with_returns = pd.merge(
+                    self.orders,
+                    product_stats[['product_id', 'product_return_rate', 'avg_refund']],
+                    on='product_id',
+                    how='left'
+                )
+                
+                # Group by customer and calculate mean metrics
+                customer_product_features = orders_with_returns.groupby('customer_id').agg(
+                    avg_product_return_rate=('product_return_rate', 'mean'),
+                    avg_product_refund=('avg_refund', 'mean')
+                ).reset_index()
+                
+                elapsed = time.time() - start_time
+                print(f"  ✓ Processed product features in {elapsed:.1f}s")
+                
+                return customer_product_features
         
-        product_stats = pd.concat([product_returns, product_orders], axis=1).fillna(0)
-        product_stats['product_return_rate'] = (
-            product_stats['product_return_count'] / product_stats['product_order_count']
-        ).fillna(0)
-        
-        # Merge with products for category info
-        product_stats = product_stats.merge(
-            self.products[['product_id', 'category']], 
-            left_index=True, 
-            right_on='product_id'
-        )
-        
-        # Customer-product interactions
-        customer_product_features = self.orders.merge(
-            product_stats, on='product_id'
-        ).groupby('customer_id').agg({
-            'product_return_rate': 'mean',
-            'refund_amount': 'mean'
-        }).rename(columns={
-            'product_return_rate': 'avg_product_return_rate',
-            'refund_amount': 'avg_product_refund'
-        })
-        
-        return customer_product_features.reset_index()
+        # Return empty DataFrame with expected columns if no data
+        return pd.DataFrame(columns=['customer_id', 'avg_product_return_rate', 'avg_product_refund'])
     
-    def detect_anomalies(self):
-        """Apply multiple anomaly detection methods"""
+    def detect_anomalies(self, sample_size=10000):
+        """Apply multiple anomaly detection methods with optimizations"""
         print("Detecting anomalies...")
+        start_time = time.time()
         
-        # Prepare feature matrix (exclude customer_id)
-        feature_cols = [col for col in self.features.columns if col != 'customer_id']
-        X = self.features[feature_cols].fillna(0)
+        # Prepare feature matrix (exclude customer_id and non-numeric columns)
+        non_feature_cols = ['customer_id', 'is_fraudster', 'fraud_type']
+        feature_cols = [col for col in self.features.columns if col not in non_feature_cols]
+        
+        # Convert to numpy for faster operations
+        X = self.features[feature_cols].fillna(0).values
         
         # Scale features
         X_scaled = self.scaler.fit_transform(X)
         
-        # 1. Isolation Forest
+        # For large datasets, use a sample for DBSCAN which is O(n²)
+        use_sample = len(X_scaled) > sample_size
+        
+        if use_sample:
+            print(f"  Large dataset detected ({len(X_scaled):,} records). Using a sample for DBSCAN...")
+            sample_indices = np.random.choice(len(X_scaled), size=sample_size, replace=False)
+            X_sample = X_scaled[sample_indices]
+        
+        # 1. Isolation Forest (handles large datasets well)
+        print("  Running Isolation Forest...")
         isolation_scores = self.isolation_forest.fit_predict(X_scaled)
         isolation_anomalies = (isolation_scores == -1)
         
-        # 2. DBSCAN Clustering
-        cluster_labels = self.dbscan.fit_predict(X_scaled)
-        dbscan_anomalies = (cluster_labels == -1)
+        # 2. DBSCAN (expensive, use sample for large datasets)
+        print("  Running DBSCAN...")
+        if use_sample:
+            # Train on sample, predict on full dataset
+            self.dbscan.fit(X_sample)
+            # Approximate nearest neighbors for prediction on full dataset
+            from sklearn.neighbors import NearestNeighbors
+            nbrs = NearestNeighbors(n_neighbors=5).fit(X_sample)
+            distances, indices = nbrs.kneighbors(X_scaled)
+            # Assign cluster based on nearest neighbor
+            dbscan_anomalies = np.array([self.dbscan.labels_[indices[i][0]] == -1 for i in range(len(X_scaled))])
+        else:
+            # Small dataset, run directly
+            cluster_labels = self.dbscan.fit_predict(X_scaled)
+            dbscan_anomalies = (cluster_labels == -1)
         
         # 3. Statistical outliers (Z-score > 3)
-        z_scores = np.abs((X - X.mean()) / X.std())
+        print("  Detecting statistical outliers...")
+        z_scores = np.abs((X - X.mean(axis=0)) / (X.std(axis=0) + 1e-10))  # Add small epsilon to avoid division by zero
         statistical_anomalies = (z_scores > 3).any(axis=1)
         
         # Combine results
@@ -210,15 +344,21 @@ class ReturnFraudDetector:
         ) / 3
 
         # Keep all customers, but treat those with no returns as non-suspicious
-        zero_return_mask = self.features['total_returns'] == 0
-        self.features.loc[zero_return_mask, ['isolation_anomaly', 'dbscan_anomaly', 'statistical_anomaly']] = False
-        self.features.loc[zero_return_mask, 'fraud_score'] = 0
+        if 'total_returns' in self.features.columns:
+            zero_return_mask = self.features['total_returns'] == 0
+            self.features.loc[zero_return_mask, ['isolation_anomaly', 'dbscan_anomaly', 'statistical_anomaly']] = False
+            self.features.loc[zero_return_mask, 'fraud_score'] = 0
         
-        # Add actual fraud labels for evaluation
-        self.features = self.features.merge(
-            self.customers[['customer_id', 'is_fraudster', 'fraud_type']], 
-            on='customer_id'
-        )
+        # Add actual fraud labels for evaluation if they exist
+        if all(col in self.customers.columns for col in ['customer_id', 'is_fraudster', 'fraud_type']):
+            self.features = self.features.merge(
+                self.customers[['customer_id', 'is_fraudster', 'fraud_type']], 
+                on='customer_id',
+                how='left'
+            )
+        
+        elapsed = time.time() - start_time
+        print(f"  ✓ Completed anomaly detection in {elapsed:.1f}s")
         
         return self.features
     
