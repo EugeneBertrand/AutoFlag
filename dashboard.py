@@ -10,6 +10,8 @@ import io
 from generate_dataset import ECommerceDataGenerator
 from fraud_detector import ReturnFraudDetector
 import warnings
+import sqlite3
+from contextlib import closing
 warnings.filterwarnings('ignore')
 
 # Page config
@@ -269,48 +271,52 @@ def main():
     # DataFrame to display throughout dashboard
     display_df = filtered_results
     
-    # Main dashboard
-    col1, col2, col3, col4 = st.columns(4)
+    # Create tabs for different views
+    tab1, tab2 = st.tabs(["📊 Dashboard", "🔍 Customer Explorer"])
     
-    with col1:
-        st.markdown('<div class="metric-card">', unsafe_allow_html=True)
-        st.metric(
-            "Total Customers", 
-            f"{len(results):,}",
-            help="Total number of customers analyzed"
-        )
-        st.markdown('</div>', unsafe_allow_html=True)
-    
-    with col2:
-        suspicious_count = len(display_df)
-        st.markdown('<div class="metric-card">', unsafe_allow_html=True)
-        st.metric(
-            "Suspicious Customers", 
-            f"{suspicious_count:,}",
-            delta=f"{suspicious_count/len(results)*100:.1f}%"
-        )
-        st.markdown('</div>', unsafe_allow_html=True)
-    
-    with col3:
-        # Always show total confirmed fraudsters regardless of return-rate slider
-        actual_fraudsters = results['is_fraudster'].sum()
-        st.markdown('<div class="metric-card">', unsafe_allow_html=True)
-        st.metric(
-            "Actual Fraudsters", 
-            f"{actual_fraudsters:,}",
-            delta=f"{actual_fraudsters/len(results)*100:.1f}%"
-        )
-        st.markdown('</div>', unsafe_allow_html=True)
-    
-    with col4:
-        avg_return_rate = display_df['return_rate'].mean()
-        st.markdown('<div class="metric-card">', unsafe_allow_html=True)
-        st.metric(
-            "Avg Return Rate", 
-            f"{avg_return_rate:.1%}",
-            help="Average return rate across all customers"
-        )
-        st.markdown('</div>', unsafe_allow_html=True)
+    with tab1:
+        # Main dashboard content
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.markdown('<div class="metric-card">', unsafe_allow_html=True)
+            st.metric(
+                "Total Customers", 
+                f"{len(results):,}",
+                help="Total number of customers analyzed"
+            )
+            st.markdown('</div>', unsafe_allow_html=True)
+        
+        with col2:
+            suspicious_count = len(display_df)
+            st.markdown('<div class="metric-card">', unsafe_allow_html=True)
+            st.metric(
+                "Suspicious Customers", 
+                f"{suspicious_count:,}",
+                delta=f"{suspicious_count/len(results)*100:.1f}%"
+            )
+            st.markdown('</div>', unsafe_allow_html=True)
+        
+        with col3:
+            # Always show total confirmed fraudsters regardless of return-rate slider
+            actual_fraudsters = results['is_fraudster'].sum()
+            st.markdown('<div class="metric-card">', unsafe_allow_html=True)
+            st.metric(
+                "Actual Fraudsters", 
+                f"{actual_fraudsters:,}",
+                delta=f"{actual_fraudsters/len(results)*100:.1f}%"
+            )
+            st.markdown('</div>', unsafe_allow_html=True)
+        
+        with col4:
+            avg_return_rate = display_df['return_rate'].mean()
+            st.markdown('<div class="metric-card">', unsafe_allow_html=True)
+            st.metric(
+                "Avg Return Rate", 
+                f"{avg_return_rate:.1%}",
+                help="Average return rate across all customers"
+            )
+            st.markdown('</div>', unsafe_allow_html=True)
     
     # Store filter values in a dict to pass to tabs
     filter_params = {
@@ -323,7 +329,7 @@ def main():
         "🚨 Suspicious Customers", 
         "📊 Analytics", 
         "🎯 Model Performance", 
-        "🔍 Customer Deep Dive",
+        "🔍 Customer Deep Dive & SQL Explorer",
         "📈 Fraud Patterns"
     ])
     
@@ -492,67 +498,286 @@ def main():
             st.metric("False Negatives", fn)
     
     with tab4:
-        st.header("Customer Deep Dive")
+        st.header("🔍 Customer Deep Dive & SQL Explorer")
         
-        # Customer selector
-        customer_ids = results['customer_id'].tolist()
-        selected_customer = st.selectbox("Select Customer ID", customer_ids)
+        # Create an in-memory SQLite database
+        def create_sqlite_db(detector):
+            try:
+                conn = sqlite3.connect(":memory:")
+                
+                # Convert datetime columns to string for SQLite
+                dfs = {
+                    'customers': detector.customers.copy(),
+                    'orders': detector.orders.copy() if hasattr(detector, 'orders') else pd.DataFrame(),
+                    'returns': detector.returns.copy() if hasattr(detector, 'returns') else pd.DataFrame(),
+                    'products': detector.products.copy() if hasattr(detector, 'products') else pd.DataFrame()
+                }
+                
+                # Convert datetime columns to string
+                for df_name, df in dfs.items():
+                    if not df.empty:
+                        for col in df.select_dtypes(include=['datetime64']).columns:
+                            df[col] = df[col].astype(str)
+                        df.to_sql(df_name, conn, if_exists='replace', index=False)
+                
+                return conn
+            except Exception as e:
+                st.error(f"Error creating SQLite database: {str(e)}")
+                return None
         
-        if selected_customer:
-            customer_data = results[results['customer_id'] == selected_customer].iloc[0]
+        # Function to run SQL queries
+        def run_sql_query(conn, query, params=None):
+            try:
+                with closing(conn.cursor()) as cur:
+                    if params:
+                        cur.execute(query, params)
+                    else:
+                        cur.execute(query)
+                    
+                    # Get column names
+                    columns = [desc[0] for desc in cur.description] if cur.description else []
+                    
+                    # Fetch all rows
+                    rows = cur.fetchall()
+                    
+                    # Return empty DataFrame if no rows
+                    if not rows:
+                        return pd.DataFrame(columns=columns)
+                            
+                    return pd.DataFrame(rows, columns=columns)
+            except Exception as e:
+                st.error(f"Error executing query: {str(e)}\n\nQuery:\n{query}")
+                return pd.DataFrame()
+        
+        try:
+            # Create database connection
+            conn = create_sqlite_db(detector)
+            if conn is None:
+                st.error("Failed to create database connection")
+                st.stop()
             
-            # Customer overview
-            col1, col2 = st.columns(2)
+            # Get customer list with order/return stats
+            customer_query = """
+            SELECT 
+                c.customer_id,
+                c.registration_date,
+                c.location,
+                (SELECT COUNT(*) FROM orders o WHERE o.customer_id = c.customer_id) as total_orders,
+                (SELECT COUNT(*) FROM returns r JOIN orders o2 ON r.order_id = o2.order_id 
+                 WHERE o2.customer_id = c.customer_id) as total_returns
+            FROM customers c
+            ORDER BY total_returns DESC, total_orders DESC
+            LIMIT 1000
+            """
             
-            with col1:
-                st.subheader("Customer Profile")
-                st.write(f"**Customer ID:** {customer_data['customer_id']}")
-                st.write(f"**Fraud Score:** {customer_data['fraud_score']:.3f}")
-                if pd.isna(customer_data['is_fraudster']):
-                    st.write("**Actual Fraudster:** Unknown")
-                elif customer_data['is_fraudster']:
-                    st.write("**Actual Fraudster:** Yes")
-                    st.write(f"**Fraud Type:** {customer_data['fraud_type']}")
-                else:
-                    st.write("**Actual Fraudster:** No")
+            customer_df = run_sql_query(conn, customer_query)
             
-            with col2:
-                st.subheader("Behavioral Metrics")
-                st.metric("Return Rate", f"{customer_data['return_rate']:.1%}")
-                st.metric("Total Orders", f"{customer_data['total_orders']:.0f}")
-                st.metric("Total Returns", f"{customer_data['total_returns']:.0f}")
-                st.metric("Avg Return Days", f"{customer_data['avg_return_days']:.1f}")
-            
-            # Customer's order and return history
-            customer_orders = detector.orders[detector.orders['customer_id'] == selected_customer]
-            customer_returns = detector.returns[detector.returns['customer_id'] == selected_customer]
-            
-            if len(customer_returns) > 0:
-                st.subheader("Return History")
+            if customer_df.empty:
+                st.warning("No customer data found in the database.")
+                st.stop()
                 
-                # Timeline of returns
-                returns_timeline = customer_returns.copy()
-                returns_timeline['return_date'] = pd.to_datetime(returns_timeline['return_date'])
+            # Calculate return rate
+            customer_df['return_rate'] = customer_df.apply(
+                lambda x: x['total_returns'] / x['total_orders'] if x['total_orders'] > 0 else 0,
+                axis=1
+            )
+            
+            # Customer selector with stats
+            selected_customer = st.selectbox(
+                "Select a customer:",
+                options=customer_df['customer_id'].tolist(),
+                format_func=lambda x: f"{x} (Orders: {customer_df[customer_df['customer_id'] == x]['total_orders'].values[0]}, "
+                                    f"Returns: {customer_df[customer_df['customer_id'] == x]['total_returns'].values[0]}, "
+                                    f"Return Rate: {customer_df[customer_df['customer_id'] == x]['return_rate'].values[0]:.1%})"
+            )
+            
+            # Get selected customer data
+            customer_data = results[results['customer_id'] == selected_customer].iloc[0] if not results.empty else None
+            
+            # Customer Profile and Metrics
+            if customer_data is not None:
+                col1, col2 = st.columns(2)
                 
-                fig_timeline = px.scatter(
-                    returns_timeline,
-                    x='return_date',
-                    y='days_to_return',
-                    color='return_status',
-                    size=returns_timeline['refund_amount'].fillna(0),
-                    hover_data=['return_reason'],
-                    title="Return Timeline"
+                with col1:
+                    st.subheader("👤 Customer Profile")
+                    st.metric("Customer ID", customer_data['customer_id'])
+                    st.metric("Registration Date", customer_data.get('registration_date', 'N/A'))
+                    st.metric("Location", customer_data.get('location', 'N/A'))
+                    
+                    st.write("**Fraud Analysis**")
+                    st.metric("Fraud Score", f"{customer_data['fraud_score']:.3f}")
+                    if pd.isna(customer_data['is_fraudster']):
+                        st.write("**Actual Fraudster:** Unknown")
+                    elif customer_data['is_fraudster']:
+                        st.write("**Actual Fraudster:** Yes")
+                        st.write(f"**Fraud Type:** {customer_data['fraud_type']}")
+                    else:
+                        st.write("**Actual Fraudster:** No")
+                
+                with col2:
+                    st.subheader("📊 Behavioral Metrics")
+                    st.metric("Total Orders", f"{customer_data['total_orders']:,}")
+                    st.metric("Total Returns", f"{customer_data['total_returns']:,}")
+                    st.metric("Return Rate", f"{customer_data['return_rate']:.1%}")
+                    st.metric("Avg Return Days", 
+                            f"{customer_data['avg_return_days']:.1f}" if 'avg_return_days' in customer_data else "N/A")
+                    st.metric("Avg Order Value", 
+                            f"${customer_data.get('avg_order_value', 0):,.2f}" if 'avg_order_value' in customer_data else "N/A")
+            
+            # Get customer's order history with return status using SQL
+            order_history_query = """
+            WITH order_products AS (
+                SELECT 
+                    o.order_id,
+                    GROUP_CONCAT(DISTINCT p.category) as product_categories
+                FROM orders o
+                LEFT JOIN products p ON o.product_id = p.product_id
+                WHERE o.customer_id = ?
+                GROUP BY o.order_id
+            )
+            SELECT 
+                o.order_id,
+                o.order_date,
+                o.delivery_date,
+                o.total_amount,
+                r.return_date,
+                r.return_reason,
+                r.refund_amount,
+                r.return_status,
+                CASE WHEN r.return_id IS NOT NULL THEN 1 ELSE 0 END as was_returned,
+                op.product_categories
+            FROM orders o
+            LEFT JOIN returns r ON o.order_id = r.order_id
+            LEFT JOIN order_products op ON o.order_id = op.order_id
+            WHERE o.customer_id = ?
+            GROUP BY o.order_id
+            ORDER BY o.order_date DESC
+            """
+            
+            order_history = run_sql_query(conn, order_history_query, (selected_customer, selected_customer))
+            
+            # Display order history
+            if not order_history.empty:
+                st.subheader("📦 Order History")
+                
+                # Convert datetime columns
+                date_cols = ['order_date', 'delivery_date', 'return_date']
+                for col in date_cols:
+                    if col in order_history.columns:
+                        order_history[col] = pd.to_datetime(order_history[col])
+                
+                # Format currency columns
+                currency_cols = ['total_amount', 'refund_amount']
+                for col in currency_cols:
+                    if col in order_history.columns:
+                        order_history[col] = order_history[col].apply(
+                            lambda x: f"${float(x):,.2f}" if pd.notnull(x) and str(x).strip() != '' else ""
+                        )
+                
+                # Display the data
+                st.dataframe(
+                    order_history,
+                    column_config={
+                        "order_id": "Order ID",
+                        "order_date": "Order Date",
+                        "delivery_date": "Delivery Date",
+                        "total_amount": "Order Total",
+                        "return_date": "Return Date",
+                        "return_reason": "Return Reason",
+                        "refund_amount": "Refund Amount",
+                        "return_status": "Status",
+                        "was_returned": "Returned",
+                        "product_categories": "Categories"
+                    },
+                    hide_index=True,
+                    use_container_width=True,
+                    height=400
                 )
-                st.plotly_chart(fig_timeline, use_container_width=True)
+            
+            # Return Analysis
+            customer_returns = detector.returns[detector.returns['customer_id'] == selected_customer] if hasattr(detector, 'returns') else pd.DataFrame()
+            
+            if not customer_returns.empty:
+                st.subheader("📊 Return Analysis")
                 
-                # Return reasons
-                reason_counts = customer_returns['return_reason'].value_counts()
-                fig_reasons = px.pie(
-                    values=reason_counts.values,
-                    names=reason_counts.index,
-                    title="Return Reasons Distribution"
-                )
-                st.plotly_chart(fig_reasons, use_container_width=True)
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    # Timeline of returns
+                    returns_timeline = customer_returns.copy()
+                    returns_timeline['return_date'] = pd.to_datetime(returns_timeline['return_date'])
+                    
+                    fig_timeline = px.scatter(
+                        returns_timeline,
+                        x='return_date',
+                        y='days_to_return',
+                        color='return_status',
+                        size=returns_timeline['refund_amount'].fillna(0),
+                        hover_data=['return_reason'],
+                        title="Return Timeline"
+                    )
+                    st.plotly_chart(fig_timeline, use_container_width=True)
+                
+                with col2:
+                    # Return reasons
+                    reason_counts = customer_returns['return_reason'].value_counts()
+                    if not reason_counts.empty:
+                        fig_reasons = px.pie(
+                            values=reason_counts.values,
+                            names=reason_counts.index,
+                            title="Return Reasons Distribution"
+                        )
+                        st.plotly_chart(fig_reasons, use_container_width=True)
+            
+            # Custom SQL Query Section
+            st.subheader("🔍 Run Custom SQL Query")
+            
+            # Show table schemas for reference
+            with st.expander("📋 Database Schema"):
+                st.write("""
+                **Tables and their columns:**
+                - `customers`: customer_id, registration_date, location, ...
+                - `orders`: order_id, customer_id, product_id, order_date, delivery_date, total_amount, ...
+                - `returns`: return_id, order_id, return_date, return_reason, refund_amount, return_status, ...
+                - `products`: product_id, category, price, ...
+                """)
+            
+            query = st.text_area(
+                "Enter your SQL query:", 
+                """
+                SELECT 
+                    c.customer_id,
+                    COUNT(DISTINCT o.order_id) as order_count,
+                    COUNT(DISTINCT r.return_id) as return_count,
+                    ROUND(COUNT(DISTINCT r.return_id) * 1.0 / 
+                          NULLIF(COUNT(DISTINCT o.order_id), 0), 2) as return_rate
+                FROM customers c
+                LEFT JOIN orders o ON c.customer_id = o.customer_id
+                LEFT JOIN returns r ON o.order_id = r.order_id
+                GROUP BY c.customer_id
+                ORDER BY return_rate DESC
+                LIMIT 10
+                """,
+                height=150
+            )
+            
+            if st.button("Run Query"):
+                try:
+                    result = run_sql_query(conn, query)
+                    st.dataframe(
+                        result,
+                        hide_index=True,
+                        use_container_width=True,
+                        height=400
+                    )
+                except Exception as e:
+                    st.error(f"Error executing query: {str(e)}")
+            
+        except Exception as e:
+            st.error(f"Error in Customer Deep Dive: {str(e)}")
+        finally:
+            if 'conn' in locals():
+                conn.close()
     
     with tab5:
         st.header("Fraud Pattern Analysis")
@@ -628,7 +853,9 @@ def main():
                 else:
                     st.info("Return timing data not available for this dataset.")
             else:
-                st.info("No fraudulent returns found in the dataset.")
+                st.info("No fraud data available for category analysis.")
+    
+
 
 if __name__ == "__main__":
     main()
