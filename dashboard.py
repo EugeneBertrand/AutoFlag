@@ -499,13 +499,11 @@ This ZIP file contains CSV files formatted for easy import into Tableau.
     }
     
     # Tabs for different views
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    tab1, tab2, tab3, tab4 = st.tabs([
         "📊 Dashboard", 
-        "📊 Analytics", 
-        "🎯 Model Performance", 
         "🔍 Customer Deep Dive & SQL Explorer",
         "📈 Fraud Patterns",
-        "📊 Tableau Analytics"
+        "📊 Analytics"
     ])
     
     with tab1:
@@ -553,23 +551,146 @@ This ZIP file contains CSV files formatted for easy import into Tableau.
             st.markdown('</div>', unsafe_allow_html=True)
     
     with tab2:
-        st.header("Analytics")
-        st.write("Analytics content goes here...")
+        st.header("Customer Deep Dive")
         
+        # Customer selector
+        customer_ids = results['customer_id'].tolist()
+        selected_customer = st.selectbox("Select Customer ID", customer_ids)
+        
+        if selected_customer:
+            customer_data = results[results['customer_id'] == selected_customer].iloc[0]
+            
+            # Customer overview
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.subheader("Customer Profile")
+                st.write(f"**Customer ID:** {customer_data['customer_id']}")
+                st.write(f"**Fraud Score:** {customer_data['fraud_score']:.3f}")
+                if pd.isna(customer_data['is_fraudster']):
+                    st.write("**Actual Fraudster:** Unknown")
+                elif customer_data['is_fraudster']:
+                    st.write("**Actual Fraudster:** Yes")
+                    st.write(f"**Fraud Type:** {customer_data['fraud_type']}")
+                else:
+                    st.write("**Actual Fraudster:** No")
+            
+            with col2:
+                st.subheader("Behavioral Metrics")
+                st.metric("Return Rate", f"{customer_data['return_rate']:.1%}")
+                st.metric("Total Orders", f"{customer_data['total_orders']:.0f}")
+                st.metric("Total Returns", f"{customer_data['total_returns']:.0f}")
+                st.metric("Avg Return Days", f"{customer_data['avg_return_days']:.1f}")
+            
+            # Customer's order and return history
+            customer_orders = detector.orders[detector.orders['customer_id'] == selected_customer]
+            customer_returns = detector.returns[detector.returns['customer_id'] == selected_customer]
+            
+            if len(customer_returns) > 0:
+                st.subheader("Return History")
+                
+                # Timeline of returns
+                returns_timeline = customer_returns.copy()
+                returns_timeline['return_date'] = pd.to_datetime(returns_timeline['return_date'])
+                
+                fig_timeline = px.scatter(
+                    returns_timeline,
+                    x='return_date',
+                    y='days_to_return',
+                    color='return_status',
+                    size=returns_timeline['refund_amount'].fillna(0),
+                    hover_data=['return_reason'],
+                    title="Return Timeline"
+                )
+                st.plotly_chart(fig_timeline, use_container_width=True)
+                
+                # Return reasons
+                reason_counts = customer_returns['return_reason'].value_counts()
+                fig_reasons = px.pie(
+                    values=reason_counts.values,
+                    names=reason_counts.index,
+                    title="Return Reasons Distribution"
+                )
+                st.plotly_chart(fig_reasons, use_container_width=True)
+    
     with tab3:
-        st.header("Model Performance")
-        st.write("Model performance metrics and visualizations...")
+        st.header("Fraud Pattern Analysis")
+        
+        # Fraud patterns over time
+        if len(detector.returns) > 0:
+            returns_with_fraud = detector.returns.merge(
+                results[['customer_id', 'fraud_score']],
+                on='customer_id'
+            )
+            # Treat customers above the threshold as fraudsters for visualisation
+            returns_with_fraud['is_fraudster'] = returns_with_fraud['fraud_score'] >= fraud_threshold
+            
+            returns_with_fraud['return_date'] = pd.to_datetime(returns_with_fraud['return_date'])
+            returns_with_fraud['month'] = returns_with_fraud['return_date'].dt.to_period('M')
+            
+            # Monthly fraud trends
+            monthly_fraud = returns_with_fraud.groupby(['month', 'is_fraudster']).size().unstack(fill_value=0)
+            
+            if True in monthly_fraud.columns and False in monthly_fraud.columns:
+                fig_trends = go.Figure()
+                fig_trends.add_trace(go.Scatter(
+                    x=monthly_fraud.index.astype(str),
+                    y=monthly_fraud[True],
+                    mode='lines+markers',
+                    name='Fraudulent Returns',
+                    line=dict(color='red')
+                ))
+                fig_trends.add_trace(go.Scatter(
+                    x=monthly_fraud.index.astype(str),
+                    y=monthly_fraud[False],
+                    mode='lines+markers',
+                    name='Legitimate Returns',
+                    line=dict(color='blue')
+                ))
+                fig_trends.update_layout(title="Monthly Return Trends")
+                st.plotly_chart(fig_trends, use_container_width=True)
+            
+            # Fraud by product category
+            # Attach product category for analysis
+            if 'category' not in returns_with_fraud.columns and 'product_id' in returns_with_fraud.columns:
+                returns_with_fraud = returns_with_fraud.merge(
+                    detector.products[['product_id', 'category']],
+                    on='product_id', how='left'
+                )
+            fraud_by_category = returns_with_fraud[returns_with_fraud['is_fraudster'] == True]
+            if 'category' in fraud_by_category.columns and len(fraud_by_category) > 0:
+                category_fraud = fraud_by_category.groupby('category').size().sort_values(ascending=False)
+                
+                fig_category = px.bar(
+                    x=category_fraud.index,
+                    y=category_fraud.values,
+                    title="Fraudulent Returns by Product Category"
+                )
+                st.plotly_chart(fig_category, use_container_width=True)
+
+                # Return timing patterns
+                if (
+                    'days_to_return' in returns_with_fraud.columns and
+                    returns_with_fraud['days_to_return'].notna().any()
+                ):
+                    fraud_timing = (
+                        returns_with_fraud
+                        .dropna(subset=['days_to_return'])
+                        .groupby('is_fraudster')['days_to_return']
+                        .describe()
+                    )
+                    if not fraud_timing.empty:
+                        st.subheader("Return Timing Analysis")
+                        st.dataframe(fraud_timing.round(2))
+                    else:
+                        st.info("Not enough return timing data to compute statistics.")
+                else:
+                    st.info("Return timing data not available for this dataset.")
+            else:
+                st.info("No fraudulent returns found in the dataset.")
         
     with tab4:
-        st.header("Customer Deep Dive & SQL Explorer")
-        # Existing customer deep dive content will go here
-        
-    with tab5:
-        st.header("Fraud Pattern Analysis")
-        st.write("Fraud pattern analysis visualizations...")
-        
-    with tab6:
-        st.header("📊 Tableau Analytics")
+        st.header("📊 Analytics")
         
         if 'detector' in st.session_state and 'analysis_results' in st.session_state:
             data = st.session_state.analysis_results
